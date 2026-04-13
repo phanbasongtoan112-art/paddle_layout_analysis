@@ -1,7 +1,7 @@
-# Sử dụng Python 3.9 chính thức
+# Sử dụng Python 3.9-slim làm base image
 FROM python:3.9-slim
 
-# Cài đặt các thư viện hệ thống cần thiết cho OpenCV (phiên bản mới)
+# Cài đặt các thư viện hệ thống cần thiết cho OpenCV và PaddlePaddle
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -12,17 +12,18 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Tạo thư mục làm việc
+# Đặt thư mục làm việc trong container
 WORKDIR /app
 
-# Cài đặt các gói Python cần thiết
+# Cài đặt các gói Python (chú ý thứ tự: paddlex[ocr] trước paddleocr)
 RUN pip install --no-cache-dir \
     paddlepaddle==3.2.0 \
+    'paddlex[ocr]' \
     paddleocr==3.4.0 \
     opencv-python-headless \
     tqdm
 
-# Copy script vào container
+# Copy script chính vào container
 COPY paddle_ocr_batch.py /app/paddle_ocr_batch.py
 
 # Đảm bảo script có quyền thực thi

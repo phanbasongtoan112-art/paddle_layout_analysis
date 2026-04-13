@@ -1,0 +1,23 @@
+{
+  "image_path": "images\\img_1.jpg",
+  "has_table": false,
+  "region_count": 1,
+  "mean_confidence": 0.0,
+  "processing_time_s": 26.517,
+  "original_size_wh": [
+    1280,
+    720
+  ],
+  "resized_size_wh": [
+    1422,
+    800
+  ],
+  "timestamp": "2026-04-13T10:33:16.591974Z",
+  "regions": [
+    {
+      "type": "unknown",
+      "bbox": null,
+      "score": null
+    }
+  ]
+}

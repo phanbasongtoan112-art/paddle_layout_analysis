@@ -1,0 +1,5 @@
+2026-04-13 17:26:53 | FAILED | images\img_1.jpg | TypeError: 'PPStructureV3' object is not callable
+2026-04-13 17:26:53 | FAILED | images\img_100.jpg | TypeError: 'PPStructureV3' object is not callable
+2026-04-13 17:26:53 | FAILED | images\img_1000.jpg | TypeError: 'PPStructureV3' object is not callable
+2026-04-13 17:26:53 | FAILED | images\img_101.jpg | TypeError: 'PPStructureV3' object is not callable
+2026-04-13 17:26:53 | FAILED | images\img_10.jpg | TypeError: 'PPStructureV3' object is not callable

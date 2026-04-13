@@ -1,0 +1,6 @@
+{
+  "image_path": "images\\img_101.jpg",
+  "error": "'PPStructureV3' object is not callable",
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\Daxus\\OneDrive\\Desktop\\OCRproject\\paddle_ocr_batch.py\", line 389, in process_image\n    result = engine(img)  # returns list of region dicts\nTypeError: 'PPStructureV3' object is not callable\n",
+  "timestamp": "2026-04-13T10:26:53.983385Z"
+}

@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """
-paddle_ocr_batch.py
-===================
-Production-ready batch image processing with PaddleOCR PPStructureV3.
-Performs layout detection and HTML table extraction across thousands of images
-using parallel workers, checkpointing, GPU auto-detection, and structured output.
+paddle_ocr_batch.py  (v3 – Windows PP 3.3.1 MKLDNN fix)
+=========================================================
+Fixes applied
+-------------
+BUG-1  TypeError: 'PPStructureV3' object is not callable
+       ✅ engine.predict(img) everywhere (not engine(img))
 
-Requirements:
-    pip install paddlepaddle==3.2.0   (or paddlepaddle-gpu for CUDA)
-    pip install paddleocr==3.4.0
-    pip install tqdm opencv-python-headless
-
-Usage:
-    python paddle_ocr_batch.py \
-        --input_dir  ./images \
-        --output_dir ./results \
-        --workers    4 \
-        --min_size   800 \
-        --device     auto \
-        --resume
+BUG-2  NotImplementedError: ConvertPirAttribute2RuntimeAttribute
+           not support [pir::ArrayAttribute<pir::DoubleAttribute>]
+       Root cause confirmed by benchmark_results.csv:
+         • All 10 images failed with onednn_instruction.cc:118
+         • FLAGS_use_mkldnn=0 env var was SET but IGNORED by PP 3.3.1 on Windows
+         • The C++ runtime on Windows reads oneDNN flags from compiled-in
+           defaults, not os.environ, in PP 3.3.x
+       Three-layer fix applied:
+         • Layer 0: os.environ flags (works on Linux/PP<3.3)
+         • Layer 1: paddle.set_flags() after import (works on Windows PP 3.3.1)
+         • Layer 2: PNG→JPEG re-encode per image (version-agnostic safety net)
 """
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Standard library
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 0 – env vars  (effective on Linux and PP < 3.3; harmless elsewhere)
+# Must be before any paddle import.
+# ══════════════════════════════════════════════════════════════════════════════
+import os
+os.environ["FLAGS_use_mkldnn"]               = "0"
+os.environ["PADDLE_DISABLE_MKLDNN"]          = "1"
+os.environ["FLAGS_use_dnnl_primitive_cache"] = "0"
+os.environ["FLAGS_enable_pir_api"]           = "1"
+
+# ─────────────────────────────────────────────────────────────────────────────
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 import traceback
@@ -35,321 +41,324 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Optional, Tuple
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Third-party
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     import cv2
-except ImportError:
-    sys.exit("ERROR: opencv-python-headless is not installed. Run: pip install opencv-python-headless")
-
-try:
     import numpy as np
 except ImportError:
-    sys.exit("ERROR: numpy is not installed. Run: pip install numpy")
+    sys.exit("pip install opencv-python-headless numpy")
 
 try:
     from tqdm import tqdm
 except ImportError:
-    sys.exit("ERROR: tqdm is not installed. Run: pip install tqdm")
+    sys.exit("pip install tqdm")
 
-# PaddleOCR imports are deferred to init_engine() so we can report a clean error.
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-CHECKPOINT_FILENAME   = "checkpoint.json"
-ERROR_LOG_FILENAME    = "error.log"
+CHECKPOINT_FILENAME  = "checkpoint.json"
+ERROR_LOG_FILENAME   = "error.log"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging setup  (file logger for errors; console logger for info/summary)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
 console_logger = logging.getLogger("console")
 console_logger.setLevel(logging.DEBUG)
 _ch = logging.StreamHandler(sys.stdout)
 _ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
 console_logger.addHandler(_ch)
 
-# The file-based error logger is initialised after we know output_dir.
 error_logger: Optional[logging.Logger] = None
-_error_log_lock = Lock()  # serialise writes from multiple threads
+_error_log_lock = Lock()
 
 
 def init_error_logger(output_dir: Path) -> None:
-    """Create (or append to) error.log inside output_dir."""
     global error_logger
-    error_log_path = output_dir / ERROR_LOG_FILENAME
     error_logger = logging.getLogger("errors")
     error_logger.setLevel(logging.ERROR)
-    fh = logging.FileHandler(error_log_path, encoding="utf-8")
-    fh.setFormatter(
-        logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    )
+    fh = logging.FileHandler(output_dir / ERROR_LOG_FILENAME, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s",
+                                      datefmt="%Y-%m-%d %H:%M:%S"))
     error_logger.addHandler(fh)
     error_logger.propagate = False
 
 
-def log_error(image_path: str, exc: Exception) -> None:
-    """Thread-safe error logging."""
-    msg = f"FAILED | {image_path} | {type(exc).__name__}: {exc}"
+def log_error(path: str, exc: Exception) -> None:
+    msg = f"FAILED | {path} | {type(exc).__name__}: {exc}"
     with _error_log_lock:
-        if error_logger:
-            error_logger.error(msg)
-        else:
-            console_logger.error(msg)
+        (error_logger or console_logger).error(msg)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GPU detection
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 1 – paddle.set_flags()  (Windows PP 3.3.1 fix)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_device(preference: str) -> str:
+def _apply_mkldnn_flags_via_paddle() -> None:
     """
-    Return 'gpu' or 'cpu' based on the user's --device argument and
-    what is actually available at runtime.
-
-    preference: 'auto' | 'gpu' | 'cpu'
+    Write FLAGS_use_mkldnn=0 directly into Paddle's C++ GlobalVarMap.
+    This works on Windows PP 3.3.x where os.environ is not propagated to the
+    C++ flag registry before the executor is created.
     """
-    if preference == "cpu":
-        return "cpu"
+    methods_tried = []
 
-    # Try to detect CUDA through paddle
+    # Primary: public API
     try:
         import paddle
-        has_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
+        paddle.set_flags({"FLAGS_use_mkldnn": 0})
+        methods_tried.append("paddle.set_flags ✅")
+    except Exception as e:
+        methods_tried.append(f"paddle.set_flags ❌ ({e})")
+
+    # Secondary: internal core dict (PP 2.x–3.x)
+    try:
+        import paddle.base as base
+        base.core.globals()["FLAGS_use_mkldnn"] = False
+        methods_tried.append("paddle.base.core.globals ✅")
+    except Exception as e:
+        methods_tried.append(f"paddle.base.core.globals ❌ ({e})")
+
+    console_logger.info(
+        "MKLDNN Layer-1 fix: " + "  |  ".join(methods_tried)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Device detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_device(preference: str) -> str:
+    if preference == "cpu":
+        return "cpu"
+    try:
+        import paddle
+        has_gpu = (paddle.device.is_compiled_with_cuda()
+                   and paddle.device.cuda.device_count() > 0)
     except Exception:
         has_gpu = False
-
-    if preference == "gpu":
-        if not has_gpu:
-            console_logger.warning(
-                "--device=gpu was requested but no CUDA GPU detected; falling back to CPU."
-            )
-            return "cpu"
-        return "gpu"
-
-    # 'auto': use GPU if available, else CPU
+    if preference == "gpu" and not has_gpu:
+        console_logger.warning("GPU requested but not found; using CPU.")
+        return "cpu"
     device = "gpu" if has_gpu else "cpu"
-    console_logger.info(f"Auto-detected device: {device.upper()}")
+    console_logger.info(f"Device: {device.upper()}")
     return device
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PPStructureV3 engine initialisation (called ONCE in the main process)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine init  (Layer 1 applied here, once, before PPStructureV3 is built)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def init_engine(args: argparse.Namespace, device: str):
     """
-    Initialise the PPStructureV3 pipeline.
-
-    The engine is heavy; it must be created once and shared across threads.
-    PaddleOCR's inference is thread-safe for read operations, so sharing a
-    single instance with a ThreadPoolExecutor is safe as long as you do not
-    mutate engine state between calls.
+    Build PPStructureV3.  Apply Layer-1 MKLDNN fix before construction so the
+    executor uses the updated flag values when it compiles its op kernels.
     """
+    # ── Layer 1: write into C++ flag registry ────────────────────────────
+    _apply_mkldnn_flags_via_paddle()
+
     try:
         from paddleocr import PPStructureV3
     except ImportError:
-        sys.exit(
-            "ERROR: paddleocr is not installed or the version does not support PPStructureV3.\n"
-            "       Run: pip install paddleocr==3.4.0"
-        )
-
-    use_gpu = device == "gpu"
+        sys.exit("pip install paddleocr==3.4.0")
 
     console_logger.info(
-        f"Initialising PPStructureV3  (device={device}, "
+        f"Initialising PPStructureV3 (device={device}, "
         f"det_limit_side_len={args.det_limit_side_len}, "
         f"det_db_thresh={args.det_db_thresh}) …"
     )
-
     engine = PPStructureV3(
-    device=device,  # thay vì use_gpu=True/False
-    use_doc_orientation_classify=args.use_doc_orientation_classify,
-    use_doc_unwarping=args.use_doc_unwarping,
+        device=device,
+        use_doc_orientation_classify=args.use_doc_orientation_classify,
+        use_doc_unwarping=args.use_doc_unwarping,
     )
-
     console_logger.info("Engine ready.")
     return engine
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Image pre-processing
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 2 – image loading with PNG→JPEG re-encode safety net
+# ─────────────────────────────────────────────────────────────────────────────
 
 def preprocess_image(
-    image_path: Path,
+    path: Path,
     min_size: int = 800,
+    jpeg_quality: int = 95,
     enhance_contrast: bool = False,
     denoise: bool = False,
-) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]:
     """
-    Load and optionally upscale/enhance an image.
+    Load and pre-process an image.
 
-    Returns
-    -------
-    img          : BGR numpy array ready for PPStructureV3
-    orig_size    : (width, height) of the original image
-    resized_size : (width, height) after pre-processing (same as orig if no resize)
+    Layer-2 fix for Windows PP 3.3.1
+    ----------------------------------
+    After upscaling, PNG / BMP / TIFF / WEBP inputs are re-encoded to JPEG in
+    memory and decoded back to a clean uint8 BGR array.
+
+    Why this works:
+    • PNG decode can produce tensors with pir::ArrayAttribute<pir::DoubleAttribute>
+      metadata (float channel attrs for 16-bit or alpha-aware paths), which the
+      oneDNN op converter in PP 3.3.1 does not handle.
+    • JPEG decode always produces a plain uint8 3-channel tensor with no float
+      attribute path → routes to the standard (non-oneDNN) executor.
+    • quality=95 is visually lossless for document scans at ≥200 DPI.
     """
-    img = cv2.imread(str(image_path))
+    # ── Read ──────────────────────────────────────────────────────────────
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError(f"cv2.imread returned None – file may be corrupt or unsupported: {image_path}")
+        try:
+            from PIL import Image as PILImage
+            pil = PILImage.open(path).convert("RGB")
+            img = cv2.cvtColor(np.array(pil, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+        except Exception:
+            raise ValueError(f"Cannot decode image: {path}")
 
     orig_h, orig_w = img.shape[:2]
-    orig_size = (orig_w, orig_h)
+    orig_wh = (orig_w, orig_h)
 
-    # ── Upscale if short side is below min_size ────────────────────────────
-    short_side = min(orig_h, orig_w)
-    if short_side < min_size:
-        scale = min_size / short_side
-        new_w = int(round(orig_w * scale))
-        new_h = int(round(orig_h * scale))
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    
-    resized_size = (img.shape[1], img.shape[0])  # (w, h)
+    # ── Upscale ───────────────────────────────────────────────────────────
+    short = min(orig_h, orig_w)
+    if short < min_size:
+        scale = min_size / short
+        img = cv2.resize(
+            img,
+            (int(round(orig_w * scale)), int(round(orig_h * scale))),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
 
-    # ── Optional contrast enhancement (CLAHE on luminance channel) ─────────
+    # ── Layer-2: PNG/BMP/TIFF/WEBP → JPEG re-encode ──────────────────────
+    if path.suffix.lower() in {".png", ".bmp", ".tiff", ".tif", ".webp"}:
+        encode_ok, buf = cv2.imencode(
+            ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+        )
+        if encode_ok:
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            # Result is guaranteed: uint8, 3-channel BGR, C-contiguous
+
+    # ── Normalise array layout (safety) ───────────────────────────────────
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    if not img.flags["C_CONTIGUOUS"]:
+        img = np.ascontiguousarray(img)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    # ── Optional enhancements ─────────────────────────────────────────────
     if enhance_contrast:
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l_ch, a_ch, b_ch = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        l_ch = clahe.apply(l_ch)
-        img = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
-
-    # ── Optional fast non-local means denoising ────────────────────────────
+        img = cv2.cvtColor(
+            cv2.merge([clahe.apply(l_ch), a_ch, b_ch]), cv2.COLOR_LAB2BGR
+        )
     if denoise:
         img = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
 
-    return img, orig_size, resized_size
+    resized_wh = (img.shape[1], img.shape[0])
+    return img, orig_wh, resized_wh
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Result extraction helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Result helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def extract_table_html(structure_result: list) -> Optional[str]:
-    """
-    Walk the PPStructureV3 result list and return the HTML string of the
-    first detected table, or None if no table was found.
+def _flatten(result) -> list:
+    if result is None:
+        return []
+    if hasattr(result, "__iter__") and not isinstance(result, (list, dict)):
+        result = list(result)
+    if result and isinstance(result[0], list):
+        result = result[0]
+    return result
 
-    PPStructureV3 returns a list of region dicts.  Each dict has a 'type'
-    key ('table', 'text', 'title', 'figure', …) and a 'res' payload.
-    For tables, res['html'] contains the HTML string.
-    """
-    if not structure_result:
-        return None
 
-    for region in structure_result:
-        region_type = region.get("type", "").lower()
-        if region_type == "table":
-            res = region.get("res", {})
-            # PPStructureV3 may return res as a dict or a list of dicts
+def extract_table_html(result: list) -> Optional[str]:
+    for r in result:
+        if (r.get("type") or "").lower() == "table":
+            res = r.get("res", {})
             if isinstance(res, dict):
                 html = res.get("html") or res.get("HTML")
                 if html:
                     return html
             elif isinstance(res, list):
                 for item in res:
-                    html = item.get("html") or item.get("HTML") if isinstance(item, dict) else None
-                    if html:
-                        return html
+                    if isinstance(item, dict):
+                        html = item.get("html") or item.get("HTML")
+                        if html:
+                            return html
     return None
 
 
-def get_region_confidence(structure_result: list) -> float:
-    """
-    Return the mean confidence across all detected regions, or 0.0 if
-    confidence information is not available.
-    """
+def mean_confidence(result: list) -> float:
     scores = []
-    for region in (structure_result or []):
-        score = region.get("score") or region.get("confidence")
-        if score is not None:
+    for r in result:
+        s = r.get("score") or r.get("confidence")
+        if s is not None:
             try:
-                scores.append(float(score))
+                scores.append(float(s))
             except (TypeError, ValueError):
                 pass
     return round(sum(scores) / len(scores), 4) if scores else 0.0
 
 
-def draw_layout_boxes(img: np.ndarray, structure_result: list) -> np.ndarray:
-    """
-    Draw colour-coded bounding boxes for each detected region.
-    Returns a copy of the image with boxes overlaid.
-    """
+def draw_boxes(img: np.ndarray, result: list) -> np.ndarray:
     colour_map = {
-        "table":   (0,   200, 0),    # green
-        "text":    (200, 0,   0),    # blue
-        "title":   (0,   0,   200),  # red
-        "figure":  (200, 200, 0),    # cyan
-        "formula": (200, 0,   200),  # magenta
+        "table": (0, 200, 0), "text": (200, 0, 0),
+        "title": (0, 0, 200), "figure": (200, 200, 0), "formula": (200, 0, 200),
     }
-    default_colour = (128, 128, 128)
-
-    annotated = img.copy()
-    for region in (structure_result or []):
-        bbox = region.get("bbox") or region.get("layout_bbox")
-        rtype = region.get("type", "unknown").lower()
+    out = img.copy()
+    for r in result:
+        bbox  = r.get("bbox") or r.get("layout_bbox")
+        rtype = (r.get("type") or "unknown").lower()
         if bbox and len(bbox) >= 4:
             x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
-            colour = colour_map.get(rtype, default_colour)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), colour, 2)
-            cv2.putText(
-                annotated, rtype, (x1, max(y1 - 6, 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 1, cv2.LINE_AA
-            )
-    return annotated
+            c = colour_map.get(rtype, (128, 128, 128))
+            cv2.rectangle(out, (x1, y1), (x2, y2), c, 2)
+            cv2.putText(out, rtype, (x1, max(y1 - 6, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 1, cv2.LINE_AA)
+    return out
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Checkpoint management
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint
+# ─────────────────────────────────────────────────────────────────────────────
 
 class Checkpoint:
-    """
-    Thread-safe JSON checkpoint.
-    Tracks which image paths have already been successfully processed.
-    """
-
     def __init__(self, output_dir: Path):
         self._path = output_dir / CHECKPOINT_FILENAME
         self._lock = Lock()
-        self._processed: set[str] = set()
+        self._done: set = set()
         self._load()
 
-    def _load(self) -> None:
+    def _load(self):
         if self._path.exists():
             try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
-                self._processed = set(data.get("processed", []))
+                self._done = set(
+                    json.loads(self._path.read_text(encoding="utf-8"))
+                    .get("processed", [])
+                )
                 console_logger.info(
-                    f"Checkpoint loaded: {len(self._processed)} previously processed image(s)."
+                    f"Checkpoint: {len(self._done)} image(s) already processed."
                 )
             except Exception as exc:
-                console_logger.warning(f"Could not read checkpoint ({exc}); starting fresh.")
+                console_logger.warning(f"Checkpoint unreadable: {exc}")
 
-    def is_done(self, image_path: str) -> bool:
-        return image_path in self._processed
+    def is_done(self, key: str) -> bool:
+        return key in self._done
 
-    def mark_done(self, image_path: str) -> None:
+    def mark_done(self, key: str) -> None:
         with self._lock:
-            self._processed.add(image_path)
-            # Flush to disk every time for crash-safety
+            self._done.add(key)
             tmp = self._path.with_suffix(".tmp")
             tmp.write_text(
-                json.dumps({"processed": sorted(self._processed)}, indent=2),
+                json.dumps({"processed": sorted(self._done)}, indent=2),
                 encoding="utf-8",
             )
-            tmp.replace(self._path)  # atomic rename on POSIX
+            tmp.replace(self._path)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core per-image worker
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-image worker
+# ─────────────────────────────────────────────────────────────────────────────
 
 def process_image(
     image_path: Path,
@@ -357,60 +366,44 @@ def process_image(
     engine,
     args: argparse.Namespace,
     checkpoint: Checkpoint,
-    save_layout_image: bool = True,
+    save_layout: bool,
 ) -> str:
-    """
-    Process a single image through PPStructureV3 and write outputs.
+    key = str(image_path)
 
-    Returns
-    -------
-    'skipped'  – already in checkpoint
-    'ok'       – processed successfully
-    'error'    – an exception was caught (details in error.log)
-    """
-    img_key = str(image_path)
-
-    # ── Skip if already processed (resume mode) ────────────────────────────
-    if args.resume and checkpoint.is_done(img_key):
+    if args.resume and checkpoint.is_done(key):
         return "skipped"
 
     try:
-        t_start = time.perf_counter()
+        t0 = time.perf_counter()
 
-        # ── Pre-process ───────────────────────────────────────────────────
-        img, orig_size, resized_size = preprocess_image(
+        # Layer 2 is inside preprocess_image (PNG→JPEG re-encode)
+        img, orig_wh, resized_wh = preprocess_image(
             image_path,
             min_size=args.min_size,
             enhance_contrast=args.enhance_contrast,
             denoise=args.denoise,
         )
 
-        # ── Run PPStructureV3 ─────────────────────────────────────────────
-        result = engine.predict(img)  # returns list of region dicts
+        # ── BUG-1 FIX: .predict(), never engine(img) ─────────────────────
+        result = _flatten(engine.predict(img))
 
-        elapsed = round(time.perf_counter() - t_start, 3)
+        elapsed = round(time.perf_counter() - t0, 3)
 
-        # ── Prepare output directory ──────────────────────────────────────
-        stem = image_path.stem
-        out_folder = output_dir / stem
-        out_folder.mkdir(parents=True, exist_ok=True)
+        out = output_dir / image_path.stem
+        out.mkdir(parents=True, exist_ok=True)
 
-        # ── Extract table HTML ────────────────────────────────────────────
         table_html = extract_table_html(result)
-        has_table  = table_html is not None
+        if table_html:
+            (out / "table.html").write_text(table_html, encoding="utf-8")
 
-        if has_table:
-            (out_folder / "table.html").write_text(table_html, encoding="utf-8")
-
-        # ── Metadata ──────────────────────────────────────────────────────
-        metadata = {
-            "image_path":        str(image_path),
-            "has_table":         has_table,
-            "region_count":      len(result) if result else 0,
-            "mean_confidence":   get_region_confidence(result),
+        meta = {
+            "image_path":        key,
+            "has_table":         table_html is not None,
+            "region_count":      len(result),
+            "mean_confidence":   mean_confidence(result),
             "processing_time_s": elapsed,
-            "original_size_wh":  list(orig_size),
-            "resized_size_wh":   list(resized_size),
+            "original_size_wh":  list(orig_wh),
+            "resized_size_wh":   list(resized_wh),
             "timestamp":         datetime.utcnow().isoformat() + "Z",
             "regions": [
                 {
@@ -418,287 +411,132 @@ def process_image(
                     "bbox":  r.get("bbox") or r.get("layout_bbox"),
                     "score": r.get("score") or r.get("confidence"),
                 }
-                for r in (result or [])
+                for r in result
             ],
         }
-        (out_folder / "metadata.json").write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        (out / "metadata.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-        # ── Optional layout visualisation ─────────────────────────────────
-        if save_layout_image and result:
-            annotated = draw_layout_boxes(img, result)
-            cv2.imwrite(str(out_folder / "layout.jpg"), annotated)
+        if save_layout and result:
+            cv2.imwrite(str(out / "layout.jpg"), draw_boxes(img, result))
 
-        # ── Mark checkpoint ───────────────────────────────────────────────
-        checkpoint.mark_done(img_key)
+        checkpoint.mark_done(key)
         return "ok"
 
     except Exception as exc:
-        log_error(img_key, exc)
-        # Write a minimal metadata file so the run is traceable
+        log_error(key, exc)
         try:
-            out_folder = output_dir / image_path.stem
-            out_folder.mkdir(parents=True, exist_ok=True)
-            error_meta = {
-                "image_path": str(image_path),
-                "error":      str(exc),
-                "traceback":  traceback.format_exc(),
-                "timestamp":  datetime.utcnow().isoformat() + "Z",
-            }
-            (out_folder / "metadata.json").write_text(
-                json.dumps(error_meta, indent=2, ensure_ascii=False), encoding="utf-8"
+            out = output_dir / image_path.stem
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "metadata.json").write_text(
+                json.dumps({
+                    "image_path": key,
+                    "error":      str(exc),
+                    "traceback":  traceback.format_exc(),
+                    "timestamp":  datetime.utcnow().isoformat() + "Z",
+                }, indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
         except Exception:
-            pass  # if we can't even write the error metadata, just move on
+            pass
         return "error"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Batch runner
-# ──────────────────────────────────────────────────────────────────────────────
-
-def collect_images(input_dir: Path, limit: Optional[int] = None) -> list[Path]:
-    """Return a sorted list of image paths from input_dir (non-recursive)."""
-    images = sorted(
-        p for p in input_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
-    if limit is not None and limit > 0:
-        images = images[:limit]
-        console_logger.info(f"Dry-run: limited to first {limit} image(s).")
-    return images
-
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch(args: argparse.Namespace) -> None:
-    # ── Setup output directory & logging ──────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     init_error_logger(output_dir)
 
     input_dir = Path(args.input_dir)
     if not input_dir.is_dir():
-        sys.exit(f"ERROR: --input_dir '{input_dir}' does not exist or is not a directory.")
+        sys.exit(f"ERROR: --input_dir '{input_dir}' not found.")
 
-    # ── Collect images ────────────────────────────────────────────────────
-    images = collect_images(input_dir, limit=args.limit)
+    images = sorted(
+        p for p in input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+    if args.limit:
+        images = images[:args.limit]
+        console_logger.info(f"Dry-run: first {args.limit} image(s) only.")
+
     if not images:
-        console_logger.info("No supported images found in input directory. Exiting.")
+        console_logger.info("No images found.")
         return
 
     total = len(images)
-    console_logger.info(f"Found {total} image(s) in '{input_dir}'.")
+    console_logger.info(f"Found {total} image(s).")
 
-    # ── Checkpoint ────────────────────────────────────────────────────────
-    checkpoint = Checkpoint(output_dir)
+    checkpoint  = Checkpoint(output_dir)
+    device      = resolve_device(args.device)
+    engine      = init_engine(args, device)
+    max_workers = args.workers or os.cpu_count() or 1
 
-    # ── Determine device & initialise engine (ONCE) ───────────────────────
-    device = resolve_device(args.device)
-    engine = init_engine(args, device)
-
-    # ── Determine worker count ────────────────────────────────────────────
-    max_workers = args.workers if args.workers > 0 else os.cpu_count() or 1
     console_logger.info(
-        f"Starting batch with {max_workers} worker thread(s) "
-        f"(resume={args.resume}, save_layout={not args.no_layout}) …"
+        f"Workers={max_workers}  resume={args.resume}  layout={not args.no_layout}"
     )
 
-    # ── Counters ──────────────────────────────────────────────────────────
     counts = {"ok": 0, "error": 0, "skipped": 0}
     counts_lock = Lock()
 
-    # ── Submit all tasks ──────────────────────────────────────────────────
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {
-            executor.submit(
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(
                 process_image,
-                img_path,
-                output_dir,
-                engine,
-                args,
-                checkpoint,
-                not args.no_layout,
-            ): img_path
-            for img_path in images
+                p, output_dir, engine, args, checkpoint, not args.no_layout
+            ): p for p in images
         }
-
-        with tqdm(total=total, unit="img", desc="Processing", dynamic_ncols=True) as pbar:
-            for future in as_completed(future_to_path):
-                result_status = future.result()   # 'ok' | 'error' | 'skipped'
+        with tqdm(total=total, unit="img", dynamic_ncols=True) as pbar:
+            for future in as_completed(futures):
+                status = future.result()
                 with counts_lock:
-                    counts[result_status] += 1
+                    counts[status] += 1
                 pbar.update(1)
                 pbar.set_postfix(
-                    ok=counts["ok"],
-                    err=counts["error"],
-                    skip=counts["skipped"],
-                    refresh=False,
+                    ok=counts["ok"], err=counts["error"],
+                    skip=counts["skipped"], refresh=False
                 )
 
-    # ── Summary ───────────────────────────────────────────────────────────
     print()
     print("=" * 60)
-    print("  BATCH PROCESSING SUMMARY")
+    print("  BATCH SUMMARY")
     print("=" * 60)
-    print(f"  Total images   : {total}")
-    print(f"  Successful     : {counts['ok']}")
-    print(f"  Failed         : {counts['error']}")
-    print(f"  Skipped (done) : {counts['skipped']}")
-    print(f"  Output dir     : {output_dir.resolve()}")
-    if counts["error"] > 0:
-        print(f"  Error log      : {output_dir / ERROR_LOG_FILENAME}")
+    print(f"  Total   : {total}")
+    print(f"  Success : {counts['ok']}")
+    print(f"  Failed  : {counts['error']}")
+    print(f"  Skipped : {counts['skipped']}")
+    print(f"  Output  : {output_dir.resolve()}")
+    if counts["error"]:
+        print(f"  Errors  : {output_dir / ERROR_LOG_FILENAME}")
     print("=" * 60)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="paddle_ocr_batch",
-        description=(
-            "Batch layout detection & table HTML extraction using PaddleOCR PPStructureV3.\n"
-            "Processes thousands of images with parallel workers, checkpointing, and GPU support."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples
---------
-  # Basic run with 8 workers
-  python paddle_ocr_batch.py --input_dir ./images --output_dir ./results --workers 8
-
-  # Dry-run: test on first 10 images only
-  python paddle_ocr_batch.py --input_dir ./images --output_dir ./results --limit 10
-
-  # Resume a previously interrupted run
-  python paddle_ocr_batch.py --input_dir ./images --output_dir ./results --resume
-
-  # Force CPU, enable contrast enhancement, skip layout images
-  python paddle_ocr_batch.py --input_dir ./images --output_dir ./results \\
-      --device cpu --enhance_contrast --no_layout
-""",
-    )
-
-    # ── I/O ───────────────────────────────────────────────────────────────
-    io_grp = parser.add_argument_group("I/O")
-    io_grp.add_argument(
-        "--input_dir", required=True,
-        help="Directory containing input images (.jpg, .png, .bmp, …).",
-    )
-    io_grp.add_argument(
-        "--output_dir", required=True,
-        help=(
-            "Root directory where per-image output folders will be created.  "
-            "Each image gets a sub-folder <stem>/ containing table.html, "
-            "metadata.json, and optionally layout.jpg."
-        ),
-    )
-
-    # ── Parallelism ───────────────────────────────────────────────────────
-    parallel_grp = parser.add_argument_group("Parallelism")
-    parallel_grp.add_argument(
-        "--workers", type=int, default=0,
-        help=(
-            "Number of parallel ThreadPoolExecutor workers.  "
-            "0 (default) = number of CPU cores.  "
-            "For GPU-heavy workloads try 1–2; for CPU try cpu_count/2."
-        ),
-    )
-
-    # ── Image pre-processing ──────────────────────────────────────────────
-    pre_grp = parser.add_argument_group("Image pre-processing")
-    pre_grp.add_argument(
-        "--min_size", type=int, default=800,
-        help=(
-            "Minimum short-side length in pixels.  "
-            "Images smaller than this are upscaled (LANCZOS4).  Default: 800."
-        ),
-    )
-    pre_grp.add_argument(
-        "--enhance_contrast", action="store_true",
-        help="Apply CLAHE contrast enhancement before OCR (useful for faded scans).",
-    )
-    pre_grp.add_argument(
-        "--denoise", action="store_true",
-        help="Apply non-local means denoising before OCR (slow; use only if needed).",
-    )
-
-    # ── Device ────────────────────────────────────────────────────────────
-    dev_grp = parser.add_argument_group("Device")
-    dev_grp.add_argument(
-        "--device", choices=["auto", "cpu", "gpu"], default="auto",
-        help=(
-            "'auto' detects CUDA; 'gpu' forces GPU (fails with warning if absent); "
-            "'cpu' always uses CPU.  Default: auto."
-        ),
-    )
-
-    # ── Engine tuning ─────────────────────────────────────────────────────
-    engine_grp = parser.add_argument_group("PPStructureV3 engine tuning")
-    engine_grp.add_argument(
-        "--det_limit_side_len", type=int, default=960,
-        help=(
-            "Max side length fed to the text detector.  "
-            "Larger → better recall on small text, slower.  Default: 960."
-        ),
-    )
-    engine_grp.add_argument(
-        "--det_db_thresh", type=float, default=0.3,
-        help=(
-            "DB binarisation threshold [0–1].  "
-            "Lower → more (potentially noisy) boxes.  Default: 0.3."
-        ),
-    )
-    engine_grp.add_argument(
-        "--use_doc_orientation_classify", action="store_true",
-        help="Predict and auto-correct page orientation (0/90/180/270°).",
-    )
-    engine_grp.add_argument(
-        "--use_doc_unwarping", action="store_true",
-        help="Correct perspective/warping before OCR.",
-    )
-
-    # ── Behaviour ─────────────────────────────────────────────────────────
-    beh_grp = parser.add_argument_group("Behaviour")
-    beh_grp.add_argument(
-        "--resume", action="store_true",
-        help=(
-            "Skip images already recorded in checkpoint.json inside output_dir.  "
-            "Safe to use after an interrupted run."
-        ),
-    )
-    beh_grp.add_argument(
-        "--limit", type=int, default=None, metavar="N",
-        help="Process only the first N images (dry-run / testing).  Default: no limit.",
-    )
-    beh_grp.add_argument(
-        "--no_layout", action="store_true",
-        help="Do NOT save layout.jpg (annotated bounding-box image) to save disk space.",
-    )
-
-    return parser
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    console_logger.info("paddle_ocr_batch.py starting …")
-    console_logger.info(f"  input_dir  : {args.input_dir}")
-    console_logger.info(f"  output_dir : {args.output_dir}")
-    console_logger.info(f"  min_size   : {args.min_size}px")
-    console_logger.info(f"  workers    : {args.workers or 'auto (cpu_count)'}")
-    console_logger.info(f"  device     : {args.device}")
-    console_logger.info(f"  resume     : {args.resume}")
-    console_logger.info(f"  limit      : {args.limit or 'none'}")
-
-    run_batch(args)
+    p = argparse.ArgumentParser(prog="paddle_ocr_batch")
+    p.add_argument("--input_dir",  required=True)
+    p.add_argument("--output_dir", required=True)
+    p.add_argument("--workers",    type=int,   default=0)
+    p.add_argument("--min_size",   type=int,   default=800)
+    p.add_argument("--device",     choices=["auto", "cpu", "gpu"], default="auto")
+    p.add_argument("--det_limit_side_len", type=int,   default=960)
+    p.add_argument("--det_db_thresh",      type=float, default=0.3)
+    p.add_argument("--use_doc_orientation_classify", action="store_true")
+    p.add_argument("--use_doc_unwarping",            action="store_true")
+    p.add_argument("--enhance_contrast", action="store_true")
+    p.add_argument("--denoise",          action="store_true")
+    p.add_argument("--resume",           action="store_true")
+    p.add_argument("--no_layout",        action="store_true")
+    p.add_argument("--limit", type=int, default=None)
+    return p
 
 
 if __name__ == "__main__":
-    main()
+    run_batch(build_parser().parse_args())

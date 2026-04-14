@@ -100,3 +100,14 @@ Trích xuất bảng – Nếu vùng table được phát hiện, pipeline nhậ
 Xuất kết quả – Lưu metadata.json, table.html (nếu có), và layout.jpg.
 
 Xử lý batch – Dùng đa luồng, checkpoint, log lỗi để xử lý hàng nghìn ảnh ổn định.
+
+## Xử lý lỗi MKLDNN trên Windows
+
+Nếu gặp lỗi `NotImplementedError: ConvertPirAttribute2RuntimeAttribute...`, hãy đặt các biến môi trường sau ở đầu script:
+```python
+import os
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
+
+## Kết quả mẫu (smoke test)
+Với 10 ảnh JPG, chiến lược `safe` đạt 100% thành công, thời gian trung bình 281s/ảnh. Xem báo cáo chi tiết tại `bench/benchmark_report.md`.

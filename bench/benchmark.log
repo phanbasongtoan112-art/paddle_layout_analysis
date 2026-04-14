@@ -1,0 +1,25 @@
+2026-04-14 10:40:01 [INFO] benchmark_resumable.py starting …
+2026-04-14 10:40:01 [INFO]   input_dir   : ./images
+2026-04-14 10:40:01 [INFO]   output_dir  : ./bench
+2026-04-14 10:40:01 [INFO]   target_size : 800px
+2026-04-14 10:40:01 [INFO]   jpeg_quality: 95
+2026-04-14 10:40:01 [INFO]   limit       : 10
+2026-04-14 10:40:01 [INFO]   resume      : False
+2026-04-14 10:40:01 [INFO] --limit 10: processing first 10 image(s).
+2026-04-14 10:40:01 [INFO] --limit 10: processing first 10 image(s).
+2026-04-14 10:40:01 [INFO] Found 10 image(s) to process.
+2026-04-14 10:40:01 [INFO] Found 10 image(s) to process.
+2026-04-14 10:40:01 [INFO] Checkpoint: 10 image(s) already recorded.
+2026-04-14 10:40:01 [INFO] Checkpoint: 10 image(s) already recorded.
+2026-04-14 10:40:04 [DEBUG] paddle.fluid.core.globals failed: cannot import name 'fluid' from 'paddle' (C:\Users\Daxus\AppData\Roaming\Python\Python313\site-packages\paddle\__init__.py)
+2026-04-14 10:40:04 [DEBUG] paddle.fluid.core.globals failed: cannot import name 'fluid' from 'paddle' (C:\Users\Daxus\AppData\Roaming\Python\Python313\site-packages\paddle\__init__.py)
+2026-04-14 10:40:04 [INFO] MKLDNN Layer-1 applied via: paddle.set_flags, paddle.base.core.globals
+2026-04-14 10:40:04 [INFO] MKLDNN Layer-1 applied via: paddle.set_flags, paddle.base.core.globals
+2026-04-14 10:40:12 [INFO] Initialising PPStructureV3 (CPU, no orientation/unwarping) …
+2026-04-14 10:40:12 [INFO] Initialising PPStructureV3 (CPU, no orientation/unwarping) …
+2026-04-14 10:40:49 [INFO] Engine ready.
+2026-04-14 10:40:49 [INFO] Engine ready.
+2026-04-14 11:23:49 [INFO] Interrupted — generating partial report …
+2026-04-14 11:23:49 [INFO] Interrupted — generating partial report …
+2026-04-14 11:23:49 [ERROR]   FAILED [KeyError] 138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (16).jpg: 'inference_ms'
+2026-04-14 11:23:49 [ERROR]   FAILED [KeyError] 138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (16).jpg: 'inference_ms'

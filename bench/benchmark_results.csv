@@ -1,0 +1,19 @@
+strategy,image_name,image_format,status,inference_time_ms,preprocess_time_ms,total_time_ms,memory_delta_mb,region_count,has_table,orig_w,orig_h,resized_w,resized_h,error_type,error_message,warmup
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (1).jpg,jpg,success,432233.26,41.27,432275.04,783.88,1,False,1700,2200,1700,2200,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (10).jpg,jpg,success,210953.26,23.32,210976.85,735.5,1,False,816,1056,816,1056,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (100).jpg,jpg,success,580720.07,85.22,580805.87,-764.29,1,False,1700,2200,1700,2200,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (11).jpg,jpg,success,342992.93,62.35,343055.64,49.24,1,False,797,1124,800,1128,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (12).jpg,jpg,success,171528.73,66.29,171595.37,358.55,1,False,794,1123,800,1131,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (13).jpg,jpg,success,372395.38,51.39,372447.25,-384.57,1,False,794,1123,800,1131,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (14).jpg,jpg,success,173827.54,34.93,173862.75,64.18,1,False,816,1056,816,1056,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (15).jpg,jpg,success,135905.99,42.53,135948.93,342.66,1,False,816,1056,816,1056,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (16).jpg,jpg,success,196226.04,88.55,196314.91,-861.04,1,False,794,1123,800,1131,,,False
+safe,138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (17).jpg,jpg,success,189548.98,48.11,189597.45,-104.79,1,False,794,1059,800,1067,,,False
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (1).jpg,success,no_table,421340.6,421385.8,1700,2200,800,1035,800,1,0,0,0,0,,,2026-04-14T03:47:51.328830Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (10).jpg,success,no_table,193844.5,193876.9,816,1056,800,1035,800,1,0,0,0,0,,,2026-04-14T03:51:05.209286Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (100).jpg,success,no_table,614257.7,614297.0,1700,2200,800,1035,800,1,0,0,0,0,,,2026-04-14T04:01:19.509128Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (11).jpg,success,no_table,350944.4,350983.0,797,1124,800,1128,800,1,0,0,0,0,,,2026-04-14T04:07:10.495854Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (12).jpg,success,no_table,205240.3,205274.1,794,1123,800,1131,800,1,0,0,0,0,,,2026-04-14T04:10:35.773325Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (13).jpg,success,no_table,412798.1,412842.0,794,1123,800,1131,800,1,0,0,0,0,,,2026-04-14T04:17:28.618169Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (14).jpg,success,no_table,186719.7,186745.2,816,1056,800,1035,800,1,0,0,0,0,,,2026-04-14T04:20:35.366200Z
+138.tar_1706.07989.gz_CoPS3_arXiv_2017_17_ori (15).jpg,success,no_table,148838.5,148868.7,816,1056,800,1035,800,1,0,0,0,0,,,2026-04-14T04:23:04.237092Z
